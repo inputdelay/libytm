@@ -30,7 +30,7 @@ config = {
 }
 app = Flask(__name__)
 app.config.from_mapping(config)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": ["http://localhost:8000", "https://pulsing.netlify.app/"]}})  # Allow specific origins
 cache = Cache(app)
 
 # Dictionary to store segment information: {segment_filename: {original_url, temp_path, status, timestamp}}
