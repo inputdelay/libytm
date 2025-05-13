@@ -1,0 +1,7 @@
+yt-dlp
+ytmusicapi
+flask
+requests
+Flask-Caching
+flask_cors
+python-dotenv

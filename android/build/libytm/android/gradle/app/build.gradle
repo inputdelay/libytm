@@ -1,0 +1,62 @@
+apply plugin: 'com.android.application'
+apply plugin: 'com.chaquo.python'
+
+android {
+    // Android 14 == SDK Level 34. This number should generally be kept up to date with
+    // the most recent supported Android release.
+    compileSdkVersion 34
+
+    namespace "app.mujay.libytm.libytm"
+
+    defaultConfig {
+        applicationId "app.mujay.libytm.libytm"
+        versionCode 100
+        versionName "0.0.1"
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+
+        // Briefcase currently requires API Level 24 for the `pidof` command, and the `--pid`
+        // argument to `adb logcat`. This supports over 97% of active devices (as of sept 2024).
+        minSdkVersion 24
+        // This should generally match the compileSDKVersion from above.
+        targetSdkVersion 34
+
+        python {
+            version "3.13"
+
+            pip {
+                install "-r", "requirements.txt"
+
+                def f = new File(project.projectDir, "pip-options.txt")
+                def pipOptions = f.getText("utf-8").split("\n")
+                pipOptions = pipOptions.findAll { !it.isBlank() }
+                options(*pipOptions)
+            }
+            extractPackages "tests"
+        }
+        ndk {
+            
+            // For this Python version, only 64-bit ABIs are available.
+            abiFilters "arm64-v8a", "x86_64"
+            
+        }
+    }
+
+    compileOptions {
+      sourceCompatibility JavaVersion.VERSION_1_8
+      targetCompatibility JavaVersion.VERSION_1_8
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+}
+
+dependencies {
+    implementation fileTree(dir: 'libs', include: ['*.jar'])
+    implementation "com.google.android.material:material:1.12.0"
+}
+
+// ========== START USER PROVIDED CONTENT ==========
+

@@ -1,0 +1,19 @@
+# Android/Android Studio generated files
+*.iml
+.gradle
+/local.properties
+/.idea/.name
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/captures
+.externalNativeBuild
+.cxx
+# Python bytecode
+.pyc
+# Build products
+/android/build/libytm/android/gradle/app/build

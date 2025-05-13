@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "libytm"
+version = "0.1.0"
+description = "YouTube Music API server"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "GPLv3"
+authors = [
+    {name = "Bliss"}
+]
+classifiers = [
+]
+dependencies = [
+    "flask",
+    "flask-caching",
+    "flask-cors",
+    "ytmusicapi",
+    "yt-dlp",
+    "requests",
+    "python-dotenv"
+]
+
+[project.urls]
+Repository = "https://gitlab/mujay/libytm"
+
+[tool.setuptools]
+packages = ["libytm"]
+

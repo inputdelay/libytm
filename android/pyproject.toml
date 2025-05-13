@@ -1,0 +1,54 @@
+# This project was generated with 0.3.22 using template: https://github.com/beeware/briefcase-template@v0.3.22
+[tool.briefcase]
+project_name = "LibYTM Server"
+bundle = "app.mujay.libytm"
+version = "0.0.1"
+url = "https://libytm.mujay.app"
+license.file = "LICENSE"
+author = "Jane Developer"
+author_email = "bliss@purelymail.com"
+
+[tool.briefcase.app.libytm]
+formal_name = "LibYTM Server"
+description = "My first application"
+long_description = """More details about the app should go here.
+"""
+sources = [
+    "src/libytm",
+]
+test_sources = [
+    "tests",
+]
+
+requires = [
+    "flask",
+    "flask-caching",
+    "flask-cors",
+    "ytmusicapi",
+    "yt-dlp",
+    "requests",
+    "python-dotenv",
+    "pyopenssl",
+    "cryptography"
+]
+test_requires = [
+    "pytest",
+]
+
+
+[tool.briefcase.app.libytm.android]
+permissions = ["INTERNET", "WRITE_EXTERNAL_STORAGE", "FOREGROUND_SERVICE","POST_NOTIFICATIONS"]
+requires = [
+    "toga-android~=0.4.7",
+]
+
+base_theme = "Theme.MaterialComponents.Light.DarkActionBar"
+
+build_gradle_dependencies = [
+    "com.google.android.material:material:1.12.0",
+    # Needed for DetailedList
+    # "androidx.swiperefreshlayout:swiperefreshlayout:1.1.0",
+    # Needed for MapView
+    # "org.osmdroid:osmdroid-android:6.1.20",
+]
+
