@@ -24,7 +24,8 @@ os.makedirs("cache", exist_ok=True)
 os.makedirs("cache/segments", exist_ok=True)
 
 # Initialize yt-dlp and ytmusicapi
-ytdlp = yt_dlp.YoutubeDL()
+# yt_dlp.YoutubeDL() instance isn't strictly needed globally if only used in subprocess.run
+# ytdlp = yt_dlp.YoutubeDL() # Keep for reference, but not used directly below
 ytmusic = YTMusic()
 
 # Flask app configuration for caching
@@ -44,11 +45,10 @@ allowed_origins = [
     "http://127.0.0.1:8080",
     "https://pulsing.netlify.app",    # Production origin without trailing slash
     "https://pulsing.netlify.app/",   # Production origin with trailing slash
+    # Add other allowed origins here if needed
 ]
 
 # Apply CORS to all routes (*) with the specified list of allowed origins
-# This allows GET, HEAD, POST, OPTIONS, PUT, PATCH, DELETE methods by default
-# and handles preflight requests automatically for these origins.
 CORS(app, resources={r"/*": {"origins": allowed_origins}})
 # --- END UPDATED CORS CONFIGURATION ---
 
@@ -68,9 +68,10 @@ SEGMENT_LIFETIME = 60 * 60 * 3 # 3 hours
 
 def download_segment_task(segment_filename, original_url, temp_path):
     """Downloads a single TS segment and updates the cache."""
+    # print(f"Starting download for segment {segment_filename} from {original_url}") # Uncomment for verbose segment logging
     try:
-        #print(f"Starting download for segment {segment_filename} from {original_url}")
-        response = requests.get(original_url, stream=True, timeout=10) # Added a timeout for segment download
+        # Add a timeout for fetching individual segments
+        response = requests.get(original_url, stream=True, timeout=10)
         response.raise_for_status()
         with open(temp_path, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
@@ -79,7 +80,7 @@ def download_segment_task(segment_filename, original_url, temp_path):
             if segment_filename in segment_cache:
                 segment_cache[segment_filename]['status'] = 'downloaded'
                 segment_cache[segment_filename]['timestamp'] = time.time()
-                #print(f"Segment {segment_filename} downloaded successfully.")
+                # print(f"Segment {segment_filename} downloaded successfully.") # Uncomment for verbose segment logging
             else:
                  # This case should ideally not happen if logic is correct, but good to log
                  print(f"warning: segment {segment_filename} finished download but was removed from cache?")
@@ -107,7 +108,7 @@ def start_segment_downloads(segments_info):
     """Submits segment download tasks to the thread pool."""
     for segment_filename, original_url, temp_path in segments_info:
         segment_download_executor.submit(download_segment_task, segment_filename, original_url, temp_path)
-        #print(f"Submitted download task for {segment_filename}")
+        # print(f"Submitted download task for {segment_filename}") # Uncomment for verbose segment logging
 
 
 def purge_old_segments():
@@ -148,16 +149,18 @@ purging_thread.start()
 
 
 # Note: The original get_audio function using yt-dlp to download a single file (mp3/opus/m4a)
-# is kept, but the frontend is using the HLS streamHLS endpoint, so this route might not be used.
+# is kept, but the frontend is using the HLS streamHLS endpoint, so this route might not be used often.
 def get_audio(video_url, id):
-    """Downloads a single audio file using yt-dlp (likely not used by the HLS frontend)."""
+    """Downloads a single audio file using yt-dlp."""
+    print(f"Starting single audio download for {video_url} (ID: {id})")
     cmd = [
         sys.executable, "-m", "yt_dlp",
-        video_url.replace("\"", "\0").replace(" ", ""), # Basic sanitation
+        video_url,
         "-x", # Extract audio
         "--audio-format", "best", # Choose best audio format available
         "--no-playlist", # Ensure only the single video is processed
-        "-o", f"{os.getcwd()}/cache/{id}.%(ext)s" # Output filename format
+        "--force-keyframes-at-chapters", # Might help with seeking
+        "--output", f"{os.getcwd()}/cache/{id}.%(ext)s" # Output filename format
     ]
     cookies_path = os.environ.get('COOKIES')
     if cookies_path and os.path.exists(cookies_path): # Check if cookies file exists
@@ -167,7 +170,8 @@ def get_audio(video_url, id):
         print("No valid COOKIES environment variable or file found, proceeding without cookies.")
 
     print(f"Executing yt-dlp command: {' '.join(cmd)}")
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    # Added a timeout for the entire yt-dlp download process
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120) # Increased timeout for download
 
     print("yt-dlp stdout:", result.stdout)
     print("yt-dlp stderr:", result.stderr)
@@ -180,40 +184,37 @@ def get_audio(video_url, id):
     # Find the downloaded file based on the expected output format
     # yt-dlp outputs the final filename to stdout if successful
     downloaded_file = None
+    # Attempt to parse stdout for the destination path
     for line in result.stdout.splitlines():
         if "[ExtractAudio]" in line and "Destination:" in line:
-             # Example: [ExtractAudio] Destination: /app/cache/dQw4w9WgXcQ.opus
              parts = line.split("Destination:")
              if len(parts) > 1:
                  downloaded_file = parts[1].strip()
+                 print(f"Parsed destination from stdout: {downloaded_file}")
                  break
-        # Fallback if destination format changes or isn't logged clearly
-        if "has already been downloaded" in line and id in line:
-            # This is less reliable, but might indicate an existing file
-            print("yt-dlp reported file already downloaded, trying common extensions...")
-            for ext in ['opus', 'm4a', 'mp3', 'aac']:
-                potential_path = os.path.join("cache", f"{id}.{ext}")
-                if os.path.exists(potential_path):
-                    downloaded_file = potential_path
-                    print(f"Found existing file: {downloaded_file}")
-                    break
-            if downloaded_file:
-                break
+        if "[Merger]" in line and "Destination:" in line: # Sometimes Merged (e.g. video+audio or formats)
+             parts = line.split("Destination:")
+             if len(parts) > 1:
+                 downloaded_file = parts[1].strip()
+                 print(f"Parsed destination from stdout (Merger): {downloaded_file}")
+                 break
 
 
+    # Fallback if parsing stdout fails or file doesn't exist at reported path
     if not downloaded_file or not os.path.exists(downloaded_file):
-         # If yt-dlp didn't clearly report the path or the path doesn't exist
-         # We can try looking for common audio extensions in the cache directory
-         print("Could not find downloaded file path from yt-dlp output, searching cache dir...")
-         for ext in ['opus', 'm4a', 'mp3', 'aac', 'webm', 'ogg']: # Search common audio extensions
-            potential_path = os.path.join("cache", f"{id}.{ext}")
-            if os.path.exists(potential_path):
-                downloaded_file = potential_path
-                print(f"Found potential file: {downloaded_file}")
-                break
+         print("Could not find downloaded file path from yt-dlp output or file doesn't exist. Searching cache dir...")
+         cache_dir = os.path.join(os.getcwd(), "cache")
+         # List files starting with the ID and ending with common audio extensions
+         potential_files = [f for f in os.listdir(cache_dir) if f.startswith(f"{id}.") and (f.endswith('.opus') or f.endswith('.m4a') or f.endswith('.mp3') or f.endswith('.aac') or f.endswith('.webm') or f.endswith('.ogg'))]
+         # Sort by modified time descending to get the most recent one
+         potential_files.sort(key=lambda x: os.path.getmtime(os.path.join(cache_dir, x)), reverse=True)
 
-         if not downloaded_file:
-              raise Exception(f"yt-dlp finished without error but could not find downloaded file for ID: {id}. stdout: {result.stdout}, stderr: {result.stderr}")
+         if potential_files:
+             downloaded_file = os.path.join(cache_dir, potential_files[0])
+             print(f"Found potential file in cache dir: {downloaded_file}")
+
+         if not downloaded_file or not os.path.exists(downloaded_file):
+              raise Exception(f"yt-dlp finished without error but could not find downloaded file for ID: {id}. Looked for {id}.* in cache. stdout: {result.stdout[:500]}, stderr: {result.stderr[:500]}")
 
 
     return downloaded_file # Return the path to the downloaded file
@@ -227,22 +228,38 @@ def hi():
 # NOTE: This route is covered by the updated CORS config.
 @app.route("/lh3Proxy/<path:url>")
 def lh3(url:str):
+    # Decode the URL path segment first
     decoded_url = urllib.parse.unquote(url)
+
+    # Basic check if it looks like a full URL
+    if not decoded_url.startswith("http://") and not decoded_url.startswith("https://"):
+         print(f"Attempted proxy access with non-absolute URL: {decoded_url}")
+         return {"error":"Provided path is not a valid absolute URL."}, 422
+
+
     # Add more checks if needed based on allowed external domains
-    # Using .startswith is okay for this specific list, regex is more robust for complex patterns
-    allowed_domains = ("https://googleusercontent.com", "https://ytimg.com", "https://googlevideo.com", "https://i.ytimg.com")
-    if not decoded_url.startswith(allowed_domains):
-        print(f"Attempted proxy access to disallowed URL: {decoded_url}")
-        return {"error":"Access to this external URL is not allowed via proxy."}, 422
+    allowed_domains = ("googleusercontent.com", "ytimg.com", "googlevideo.com", "i.ytimg.com")
+    # Check if the hostname ends with any of the allowed domains
+    # This is slightly more robust than startswith on the whole URL
+    try:
+        parsed_url = urllib.parse.urlparse(decoded_url)
+        if not parsed_url.hostname or not parsed_url.hostname.endswith(allowed_domains):
+             print(f"Attempted proxy access to disallowed domain: {parsed_url.hostname} (from {decoded_url})")
+             return {"error":"Access to this external URL's domain is not allowed via proxy."}, 422
+    except Exception as e:
+         print(f"Error parsing URL {decoded_url}: {str(e)}")
+         return {"error":"Invalid URL format."}, 422
+
 
     print(f"Proxying request for: {decoded_url}")
     headers = {
        "Accept":'*/*',
-       "User-Agent":"Mozilla/5.0 (compatible; InputDelayMusic/1.0; +https://pulsing.netlify.app)" # Identify your service
+       # Identify your service, recommended for external requests
+       "User-Agent":"Mozilla/5.0 (compatible; InputDelayMusic/1.0; +https://pulsing.netlify.app)"
     }
     try:
         # Use a timeout for the proxy request
-        res = requests.get(decoded_url, headers=headers, timeout=15)
+        res = requests.get(decoded_url, headers=headers, timeout=15) # Added timeout
         res.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
 
         # Pass through relevant headers, especially Content-Type
@@ -256,9 +273,18 @@ def lh3(url:str):
 
         return Response(res.content, res.status_code, response_headers)
 
+    except requests.exceptions.Timeout:
+        print(f"Timeout proxying URL {decoded_url}")
+        return {"error": "Proxy request to external resource timed out."}, 504 # Gateway Timeout
+
     except requests.exceptions.RequestException as e:
         print(f"Error proxying URL {decoded_url}: {str(e)}")
         return {"error": f"Failed to fetch external resource: {str(e)}"}, 502 # Bad Gateway or Internal Server Error
+
+    except Exception as e:
+        print(f"Unexpected error in proxy route for {decoded_url}: {str(e)}")
+        return {"error": "Internal server error during proxy request."}, 500
+
 
 @cache.cached(timeout=300)
 @app.route("/song/<id>")
@@ -269,18 +295,35 @@ def getSong(id):
     while tries < 5:
         try:
             # Ensure signatureTimestamp is correctly obtained if necessary
-            sig_timestamp = ytmusic.get_signatureTimestamp()
-            song = ytmusic.get_song(videoId=id, signatureTimestamp=sig_timestamp)
+            # ytmusicapi v1.0.0+ handles this automatically, but keeping the call is safe
+            # sig_timestamp = ytmusic.get_signatureTimestamp() # Not needed in recent versions
+            song = ytmusic.get_song(videoId=id) # signatureTimestamp might not be needed
             if song and song.get("videoDetails"):
                 break # Successfully got details
             print(f"Attempt {tries+1}: get_song returned data but no videoDetails for ID {id}. Response keys: {song.keys() if song else 'None'}")
         except Exception as e:
             print(f"Attempt {tries+1}: Error fetching song {id}: {str(e)}")
         tries += 1
-        time.sleep(1) # Wait a bit before retrying
+        time.sleep(0.5) # Wait a bit before retrying
 
     if song and song.get("videoDetails"):
-        return song["videoDetails"]
+        # Add thumbnail proxying here
+        video_details = song["videoDetails"]
+        if video_details.get("thumbnail", {}).get("thumbnails"):
+             # Assuming the best thumbnail is the last one in the list (often highest resolution)
+             thumbnails = video_details["thumbnail"]["thumbnails"]
+             if thumbnails:
+                 best_thumbnail_url = thumbnails[-1].get("url")
+                 if best_thumbnail_url:
+                      # Encode the *original* thumbnail URL for the proxy
+                      encoded_proxy_url = urllib.parse.quote_plus(best_thumbnail_url)
+                      # Replace the original URL with the proxy URL
+                      video_details["thumbnail"]["thumbnails"] = [{"url": f"{request.url_root.rstrip('/')}/lh3Proxy/{encoded_proxy_url}"}]
+                      # Also update the main 'thumbnail' field if it exists
+                      if 'thumbnail' in video_details and 'url' in video_details['thumbnail']:
+                           video_details['thumbnail']['url'] = f"{request.url_root.rstrip('/')}/lh3Proxy/{encoded_proxy_url}"
+
+        return video_details
     elif song is not None:
          # Got a response, but missing videoDetails (might indicate geo restriction or API change)
          return {"error":"Could not find song details (API response missing 'videoDetails'). The song might be unavailable or restricted."}, 404
@@ -296,6 +339,25 @@ def getPlaylist(id):
         # ytmusic.get_playlist handles missing playlists by raising an exception
         pl = ytmusic.get_playlist(playlistId=id)
         if pl:
+             # Optional: Proxy playlist thumbnails too
+             if pl.get("thumbnails"):
+                 for thumb in pl["thumbnails"]:
+                     if thumb.get("url"):
+                         encoded_proxy_url = urllib.parse.quote_plus(thumb["url"])
+                         thumb["url"] = f"{request.url_root.rstrip('/')}/lh3Proxy/{encoded_proxy_url}"
+             if pl.get("tracks"):
+                 for track in pl["tracks"]:
+                      if track.get("thumbnail", {}).get("thumbnails"):
+                           thumbnails = track["thumbnail"]["thumbnails"]
+                           if thumbnails:
+                                best_thumbnail_url = thumbnails[-1].get("url")
+                                if best_thumbnail_url:
+                                     encoded_proxy_url = urllib.parse.quote_plus(best_thumbnail_url)
+                                     track["thumbnail"]["thumbnails"] = [{"url": f"{request.url_root.rstrip('/')}/lh3Proxy/{encoded_proxy_url}"}]
+                                     if 'thumbnail' in track and 'url' in track['thumbnail']:
+                                          track['thumbnail']['url'] = f"{request.url_root.rstrip('/')}/lh3Proxy/{encoded_proxy_url}"
+
+
              return pl
         else:
             # Should not happen based on ytmusicapi behavior, but added for safety
@@ -303,7 +365,8 @@ def getPlaylist(id):
     except Exception as e:
         print(f"Error fetching playlist {id}: {str(e)}")
         # Check if the exception is likely a "not found" from ytmusicapi
-        if "private or does not exist" in str(e).lower() or "invalid playlist id" in str(e).lower():
+        error_str = str(e).lower()
+        if "private or does not exist" in error_str or "invalid playlist id" in error_str or "404" in error_str:
              return {"error":"Could not find playlist (it might be private or does not exist)."}, 404
         else:
              return {"error":"Internal Server Error","errorDetails":str(e)}, 500
@@ -330,18 +393,25 @@ def getstream_experimental(id):
         print("No valid COOKIES environment variable or file found for stream URL fetch.")
 
     print(f"Executing yt-dlp command for stream URL: {' '.join(cmd)}")
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15) # Added timeout
+    # Added timeout for yt-dlp execution itself
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15, check=True) # Added check=True to raise exception on non-zero exit
+        m3u8_url = result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+         error_output = e.stderr or e.stdout or "Unknown yt-dlp error getting stream URL"
+         print(f"yt-dlp failed with exit code {e.returncode} for stream URL of {id}: {error_output}")
+         return {"error": f"Failed to get streaming URL for song (yt-dlp error): {error_output[:300]}..."}, 500
+    except subprocess.TimeoutExpired:
+         print(f"yt-dlp timed out getting stream URL for {id}.")
+         return {"error": "Timed out getting streaming URL."}, 504 # Gateway Timeout
+    except Exception as e:
+         print(f"Unexpected error running yt-dlp for stream URL of {id}: {str(e)}")
+         return {"error": f"Internal server error getting streaming URL: {str(e)}"}, 500
 
-    print("yt-dlp stdout (stream URL):", result.stdout)
-    print("yt-dlp stderr (stream URL):", result.stderr)
 
-    if result.returncode != 0 or not result.stdout.strip():
-        error_output = result.stderr or result.stdout or "Unknown yt-dlp error getting stream URL"
-        print(f"Error getting stream URL for {id}: {error_output}")
-        return {"error": f"Failed to get streaming URL for song: {error_output[:200]}..."}, 500 # Return error if yt-dlp fails
+    print("yt-dlp stdout (stream URL):", m3u8_url)
+    # print("yt-dlp stderr (stream URL):", result.stderr) # Can be noisy, uncomment if needed
 
-
-    m3u8_url = result.stdout.strip()
     if not m3u8_url.startswith("http"):
          print(f"Error: yt-dlp returned non-http URL: {m3u8_url}")
          return {"error": "Failed to get a valid streaming URL from YouTube."}, 500
@@ -351,41 +421,46 @@ def getstream_experimental(id):
        # Use a more standard User-Agent for fetching the HLS manifest
        "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36",
        "Accept":"application/x-mpegURL, application/vnd.apple.mpegurl, */*",
-       # Might need other headers like 'Referer' depending on YouTube's checks
        "Referer": f"https://music.youtube.com/watch?v={id}" # Referer might be important
     }
 
     try:
-        m3u8_response = requests.get(m3u8_url, headers=headers, timeout=15) # Added timeout
-        m3u8_response.raise_for_status() # Raise HTTPError for bad responses
+        # --- FIX APPLIED HERE: Added timeout and specific exception handling ---
+        # This request fetches the HLS manifest file from YouTube's servers
+        m3u8_response = requests.get(m3u8_url, headers=headers, timeout=15) # ADDED TIMEOUT
+        m3u8_response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
         m3u8_content = m3u8_response.text
         print(f"Successfully fetched m3u8 playlist for {id}.")
+
+    # --- Specific exception handling for Timeout ---
+    except requests.exceptions.Timeout:
+        print(f"Timeout while fetching m3u8 playlist from {m3u8_url}")
+        # Return a Gateway Timeout error as the external service (YouTube) didn't respond in time
+        return {"error": "Request to fetch streaming playlist timed out."}, 504
+
     except requests.exceptions.RequestException as e:
+        # This handles other requests errors like HTTPError, ConnectionError etc.
         print(f"Failed to download m3u8 playlist from {m3u8_url}: {str(e)}")
         return {"error": f"Failed to download streaming playlist: {str(e)}"}, 500
+
     except Exception as e:
+        # Catch any other unexpected errors during the fetch or initial processing
         print(f"Unexpected error processing m3u8 for {id}: {str(e)}")
         return {"error": f"Internal server error processing playlist: {str(e)}"}, 500
 
-
+    # --- Parse and rewrite the playlist ---
     new_m3u8_lines = []
     segments_to_download = []
-    # Extract base URL correctly, handling URLs with query parameters
-    base_url = m3u8_url.rsplit('/', 1)[0] + '/' if '/' in m3u8_url.rsplit('?', 1)[0] else m3u8_url # Handles URLs ending with query like .../playlist.m3u8?sig=...
+    # Use urljoin to robustly get the base URL of the manifest
+    base_url = urllib.parse.urljoin(m3u8_url, '.')
 
     for line in m3u8_content.splitlines():
         line = line.strip()
         if line.startswith("#"):
             new_m3u8_lines.append(line)
         elif line.endswith(".ts"):
-            # Construct the full original segment URL
-            if line.startswith("http"):
-                 original_ts_url = line
-            else:
-                 # Handle relative paths, ensuring base_url includes query parameters if any
-                 # This can be tricky; relying on youtube's HLS usually having full URLs or simple relative ones.
-                 # A more robust approach might use urllib.parse.urljoin
-                 original_ts_url = urllib.parse.urljoin(base_url, line)
+            # Use urljoin to get the absolute URL of the segment
+            original_ts_url = urllib.parse.urljoin(base_url, line)
 
             # Generate a unique filename for the cached segment
             segment_filename_uuid = uuid.uuid4().hex
@@ -394,39 +469,48 @@ def getstream_experimental(id):
 
             # Add segment info to the cache
             with segment_cache_lock:
-                # Check if this segment (by original URL) is *already* being processed or cached
-                # This is a simple check, better might involve hashing original URL + seq number
-                # For now, assume each line is a new segment to process based on uuid.
-                # Store a reference to the original URL for debugging/retrying if needed.
-                segment_cache[segment_filename] = {
-                    'original_url': original_ts_url,
-                    'temp_path': temp_path,
-                    'status': 'pending', # 'pending', 'downloading', 'downloaded', 'failed'
-                    'timestamp': time.time() # Timestamp when added/last accessed/status changed
-                }
-                #print(f"Added {segment_filename} to cache (pending)")
+                # Add a check to prevent adding if already exists (shouldn't happen with UUID)
+                # or if purge thread removed it recently.
+                if segment_filename not in segment_cache:
+                     segment_cache[segment_filename] = {
+                        'original_url': original_ts_url,
+                        'temp_path': temp_path,
+                        'status': 'pending', # 'pending', 'downloading', 'downloaded', 'failed'
+                        'timestamp': time.time() # Timestamp when added/last accessed/status changed
+                    }
+                     # print(f"Added {segment_filename} to cache (pending)") # Uncomment for verbose segment logging
+                else:
+                     print(f"warning: segment {segment_filename} already in cache when processing m3u8?")
+
 
             # Rewrite the segment URL in the playlist to point back to our Flask app
             # Use request.url_root to get the correct base URL (e.g., https://your-railway-app.railway.app/)
             new_segment_url = f"{request.url_root.rstrip('/')}/song/{id}/segment/{segment_filename}"
             new_m3u8_lines.append(new_segment_url)
 
-            # Add to list for downloading
+            # Add to list for background downloading
             segments_to_download.append((segment_filename, original_ts_url, temp_path))
 
     # Start downloading the segments in the background
     # The frontend player will request them when needed, and serve_segment will wait if necessary
-    start_segment_downloads(segments_to_download)
+    if segments_to_download:
+         print(f"Starting background downloads for {len(segments_to_download)} segments.")
+         start_segment_downloads(segments_to_download)
+    else:
+        print("No segments found in the m3u8 playlist.")
+        # This might indicate an invalid playlist was returned by YouTube/yt-dlp
+        return {"error": "No playable segments found in the streaming playlist."}, 500
+
 
     # Return the modified m3u8 playlist to the frontend
     # Use the correct MIME type for M3U8 playlists
     print(f"Returning modified m3u8 playlist for {id}.")
-    return Response("\n".join(new_m3u8_lines), 200, {"Content-Type": "application/x-mpegURL"}) # Standard MIME type for M3U8
+    return Response("\n".join(new_m3u8_lines), 200, {"Content-Type": "application/x-mpegURL"})
 
 @app.route("/song/<id>/segment/<segment_filename>")
 def serve_segment(id, segment_filename):
     """Serves a cached HLS segment, waiting for download if necessary."""
-    print(f"Received request for segment {segment_filename} (song {id})")
+    # print(f"Received request for segment {segment_filename} (song {id})") # Uncomment for verbose segment logging
     wait_start_time = time.time()
     wait_timeout = 45 # Max seconds to wait for a segment to download
 
@@ -441,7 +525,7 @@ def serve_segment(id, segment_filename):
              return "Segment Not Found", 404
 
         status = segment_info['status']
-        #print(f"Segment {segment_filename} status: {status}")
+        # print(f"Segment {segment_filename} status: {status}") # Uncomment for verbose segment logging
 
         if status == 'downloaded':
             # Found it and it's ready!
@@ -449,11 +533,11 @@ def serve_segment(id, segment_filename):
         elif status == 'failed':
             print(f"Segment {segment_filename} download previously failed.")
             return "Segment Download Failed", 500
-        elif status == 'pending' or status == 'downloading':
+        elif status == 'pending': # 'downloading' status could also be pending for this logic
             # Still waiting, check timeout
             if (time.time() - wait_start_time) > wait_timeout:
                 print(f"Timeout waiting for segment {segment_filename} download.")
-                # Optionally mark as failed here or just return timeout
+                # Mark as failed on timeout
                 with segment_cache_lock:
                     if segment_filename in segment_cache: # Check again before modifying
                          segment_cache[segment_filename]['status'] = 'failed' # Mark as failed on timeout
@@ -461,7 +545,8 @@ def serve_segment(id, segment_filename):
                 return "Segment Download Timeout", 504 # Gateway Timeout
 
             # Wait a bit before checking again
-            time.sleep(0.2) # Wait 200ms
+            time.sleep(0.1) # Wait 100ms
+
         else:
             # Unknown status
             print(f"Segment {segment_filename} has unknown status: {status}")
@@ -480,7 +565,8 @@ def serve_segment(id, segment_filename):
              else:
                  # Status changed or removed while we were out of the lock?
                  print(f"Segment {segment_filename} state changed unexpectedly before serving.")
-                 return "Segment State Changed", 404
+                 # This could happen if the purge thread ran just before acquiring the lock
+                 return "Segment State Changed or Removed", 404
 
 
         if not os.path.exists(segment_file_path):
@@ -494,7 +580,7 @@ def serve_segment(id, segment_filename):
              return "Segment File Not Found On Disk", 404
 
 
-        print(f"Serving segment file: {segment_file_path}")
+        # print(f"Serving segment file: {segment_file_path}") # Uncomment for verbose segment logging
         # Use mimetype video/mp2t for MPEG-2 Transport Stream segments
         return send_file(segment_file_path, mimetype="video/mp2t")
 
@@ -517,16 +603,16 @@ def getAudio(id):
     print(f"Request for single audio stream for song ID: {id}")
     try:
         # Check for existing cached files with common extensions
-        # yt-dlp adds the correct extension, so we look for files matching the ID
-        cache_dir = "cache"
-        potential_files = [os.path.join(cache_dir, f) for f in os.listdir(cache_dir) if f.startswith(f"{id}.") and (f.endswith('.opus') or f.endswith('.m4a') or f.endswith('.mp3') or f.endswith('.aac') or f.endswith('.webm') or f.endswith('.ogg'))]
+        cache_dir = os.path.join(os.getcwd(), "cache")
+        # List files starting with the ID and ending with common audio extensions
+        potential_files = [f for f in os.listdir(cache_dir) if f.startswith(f"{id}.") and (f.endswith('.opus') or f.endswith('.m4a') or f.endswith('.mp3') or f.endswith('.aac') or f.endswith('.webm') or f.endswith('.ogg'))]
 
         if potential_files:
-            # Found an existing cached file, pick the first one (could add logic to pick best extension)
-            cached_file_path = potential_files[0]
+            # Found an existing cached file, pick the first one (could add logic to pick best extension, e.g., opus)
+            cached_file_path = os.path.join(cache_dir, potential_files[0])
             print(f"Serving cached audio file: {cached_file_path}")
-            # Guess mimetype based on extension, or set a default like audio/mpeg or audio/octet-stream
-            mimetype = "audio/mpeg" # Default, or use mimetypes.guess_type(cached_file_path)[0]
+            # Guess mimetype based on extension
+            mimetype = "audio/mpeg" # Default
             if cached_file_path.endswith('.opus'): mimetype = 'audio/opus'
             elif cached_file_path.endswith('.m4a'): mimetype = 'audio/mp4' # Or audio/aac
             elif cached_file_path.endswith('.mp3'): mimetype = 'audio/mpeg'
@@ -538,6 +624,7 @@ def getAudio(id):
         else:
             print(f"Cached audio file not found for ID {id}, downloading...")
             # Download the audio file using the get_audio helper
+            # The helper function handles potential errors internally and raises exceptions
             downloaded_file_path = get_audio(f"https://youtube.com/watch?v={id}", id=id)
 
             # After get_audio runs, check again if a file exists (it should now)
@@ -558,6 +645,9 @@ def getAudio(id):
     except FileNotFoundError:
         print(f"Error: Audio file not found after download attempt for ID {id}.")
         return {"error": "Audio file not found after processing."}, 500
+    except subprocess.TimeoutExpired:
+        print(f"yt-dlp download timed out for ID {id}.")
+        return {"error": "Audio download timed out."}, 504
     except Exception as e:
         print(f"Error getting or serving audio stream for ID {id}: {str(e)}")
         # Include the exception type for better debugging
@@ -568,26 +658,34 @@ def getAudio(id):
 @app.route("/song/<id>/lyrics")
 def getLyrics(id):
     # Fetches song details first (might already be cached by getSong route)
+    # Use the getSong function to benefit from its error handling and potential caching
     song_details_response = getSong(id)
-    if isinstance(song_details_response, dict) and song_details_response.get("error"):
-        return song_details_response # Return error from getSong
+    # Check if getSong returned an error response dictionary
+    if isinstance(song_details_response, tuple) and song_details_response[1] != 200:
+        # Return the error response from getSong
+        return song_details_response
+    elif not isinstance(song_details_response, dict):
+         # getSong returned something unexpected
+         print(f"Error: getSong returned unexpected type: {type(song_details_response)}")
+         return {"error": "Failed to get song details for lyrics."}, 500
+
 
     try:
         songDetails = song_details_response
         artist_name = songDetails.get("author", "Unknown Artist")
         track_name = songDetails.get("title", "Unknown Title")
 
-        print(f"Fetching lyrics from lrclib for song {track_name} by {artist_name}")
+        print(f"Fetching lyrics from lrclib for song '{track_name}' by '{artist_name}' (ID: {id})")
 
         # Use parameters in requests.get
         lyrics_params = {
             "artist_name": artist_name,
             "track_name": track_name,
-            "album_name": songDetails.get("album", {}).get("name", "") # Include album if available
+            # Include album if available, lrclib supports it
+            "album_name": songDetails.get("album", {}).get("name", "")
         }
         # Filter out empty values
         lyrics_params = {k: v for k, v in lyrics_params.items() if v}
-
 
         # Add timeout to the external lyrics request
         lyrics_response = requests.get("https://lrclib.net/api/get", params=lyrics_params, timeout=10)
@@ -595,17 +693,26 @@ def getLyrics(id):
 
         lyrics_data = lyrics_response.json()
 
-        if lyrics_data:
-            print(f"Lyrics found for {track_name}")
+        # lrclib returns { "lyrics": "", "syncedLyrics": "", ...} for no lyrics found,
+        # or a dictionary with data if found. Check if syncedLyrics is present and not empty.
+        if lyrics_data and lyrics_data.get("syncedLyrics"):
+            print(f"Synced lyrics found for '{track_name}'")
             return lyrics_data
         else:
-            # lrclib might return an empty object or specific error structure if not found
-            print(f"Lyrics not found on lrclib for {track_name}")
-            return {"error": "Lyrics not found for this song on lrclib."}, 404
+            # Lyrics not found or lrclib returned a structure indicating no lyrics
+            print(f"Synced lyrics not found on lrclib for '{track_name}'")
+            # Return 404 specifically if lrclib says no lyrics
+            return {"error": "Synced lyrics not found for this song on lrclib."}, 404
+
+    except requests.exceptions.Timeout:
+         print(f"Timeout while fetching lyrics from lrclib for '{track_name}'")
+         return {"error": "Request to fetch lyrics timed out."}, 504
 
     except requests.exceptions.RequestException as e:
         print(f"Error fetching lyrics from lrclib: {str(e)}")
-        return {"error": f"Failed to fetch lyrics from external service: {str(e)}"}, 502 # Bad Gateway to lyrics service
+        # Check for specific HTTP errors from lrclib if needed, but 502 is good generic proxy error
+        return {"error": f"Failed to fetch lyrics from external service: {str(e)}"}, 502
+
     except Exception as e:
         print(f"Unexpected error fetching lyrics for {id}: {str(e)}")
         return {"error":"Internal Server Error fetching lyrics","errorDetails":str(e)}, 500
@@ -615,37 +722,50 @@ def getLyrics(id):
 def getYTMLyrics(id):
      # Fetches song details first (might already be cached)
     song_details_response = getSong(id)
-    if isinstance(song_details_response, dict) and song_details_response.get("error"):
-        return song_details_response # Return error from getSong
+    # Check if getSong returned an error response dictionary
+    if isinstance(song_details_response, tuple) and song_details_response[1] != 200:
+        # Return the error response from getSong
+        return song_details_response
+    elif not isinstance(song_details_response, dict):
+         # getSong returned something unexpected
+         print(f"Error: getSong returned unexpected type: {type(song_details_response)}")
+         return {"error": "Failed to get song details for YTM lyrics."}, 500
+
 
     try:
         # Get the watch playlist first to find the lyrics browseId
         print(f"Attempting to get watch playlist for lyrics browseId for {id}")
-        watch_playlist = ytmusic.get_watch_playlist(videoId=id, radio=False, limit=1) # Limit to 1 as we only need the lyrics id
+        # Use radio=False and limit=1 as we only need the lyrics id
+        watch_playlist = ytmusic.get_watch_playlist(videoId=id, radio=False, limit=1)
 
         lyrics_browse_id = watch_playlist.get("lyrics")
         if not lyrics_browse_id:
             print(f"No lyrics browse ID found in watch playlist for {id}")
-            return {"error":"Could not find official YouTube Music lyrics for this song."}, 404
+            return {"error":"Could not find official YouTube Music lyrics browse ID for this song."}, 404
 
         print(f"Found lyrics browse ID: {lyrics_browse_id}. Fetching lyrics...")
         # Fetch lyrics using the browseId
         lyrics_data = ytmusic.get_lyrics(browseId=lyrics_browse_id, timestamps=True)
 
+        # ytmusicapi get_lyrics returns a dict like {'lyrics': '...', 'source': '...'}
+        # or possibly just {'lyrics': None, 'source': None} if not found.
+        # Check if 'lyrics' key exists and is not None/empty string
         if lyrics_data and lyrics_data.get("lyrics"):
              print(f"Successfully fetched YTM lyrics for {id}.")
              return lyrics_data
         else:
             print(f"YTMusic API returned no lyrics data for browse ID {lyrics_browse_id}")
-            # API might return { "lyrics": null, "source": null }
             return {"error":"Could not retrieve official YouTube Music lyrics data."}, 404
-
 
     except Exception as e:
         print(f"Error fetching YTM lyrics for {id}: {str(e)}")
-        # Check for specific errors indicating no lyrics are available
-        if "No lyrics found" in str(e): # Example specific error string from ytmusicapi
+        # Check for specific errors indicating no lyrics are available from ytmusicapi
+        error_str = str(e)
+        if "No lyrics found" in error_str or "could not find lyrics" in error_str: # Example specific error strings
              return {"error":"Official YouTube Music lyrics are not available for this song."}, 404
+        # Check if it looks like a private/deleted video issue from the watch playlist step
+        elif "private or does not exist" in error_str.lower() or "invalid video id" in error_str.lower():
+            return {"error":"Could not get YTM lyrics (song might be private or unavailable)."}, 404
         else:
              return {"error":"Internal Server Error fetching YouTube Music lyrics","errorDetails":str(e)}, 500
 
@@ -655,23 +775,50 @@ def getYTMLyrics(id):
 def getRadio(id):
     # Fetches song details first (might already be cached)
     song_details_response = getSong(id)
-    if isinstance(song_details_response, dict) and song_details_response.get("error"):
-        return song_details_response # Return error from getSong
+    # Check if getSong returned an error response dictionary
+    if isinstance(song_details_response, tuple) and song_details_response[1] != 200:
+        # Return the error response from getSong
+        return song_details_response
+    elif not isinstance(song_details_response, dict):
+         # getSong returned something unexpected
+         print(f"Error: getSong returned unexpected type: {type(song_details_response)}")
+         return {"error": "Failed to get song details for radio."}, 500
+
 
     try:
         print(f"Fetching radio playlist for song {id}")
         # The radio=True parameter is key here
         radio = ytmusic.get_watch_playlist(videoId=id, radio=True, limit=50)
-        if radio and radio.get("playlistId"): # Check if a playlist was actually created
-             print(f"Successfully fetched radio playlist for {id}. Playlist ID: {radio['playlistId']}")
+        # ytmusicapi get_watch_playlist returns a dict containing playlist info and tracks
+        # Check if 'playlistId' and 'tracks' are present and tracks list is not empty
+        if radio and radio.get("playlistId") and radio.get("tracks"):
+             print(f"Successfully fetched radio playlist for {id}. Playlist ID: {radio['playlistId']} with {len(radio['tracks'])} tracks.")
+             # Optional: Proxy thumbnails in the radio response as well
+             if radio.get("tracks"):
+                 for track in radio["tracks"]:
+                      if track.get("thumbnail", {}).get("thumbnails"):
+                           thumbnails = track["thumbnail"]["thumbnails"]
+                           if thumbnails:
+                                best_thumbnail_url = thumbnails[-1].get("url")
+                                if best_thumbnail_url:
+                                     encoded_proxy_url = urllib.parse.quote_plus(best_thumbnail_url)
+                                     track["thumbnail"]["thumbnails"] = [{"url": f"{request.url_root.rstrip('/')}/lh3Proxy/{encoded_proxy_url}"}]
+                                     if 'thumbnail' in track and 'url' in track['thumbnail']:
+                                          track['thumbnail']['url'] = f"{request.url_root.rstrip('/')}/lh3Proxy/{encoded_proxy_url}"
+
              return radio
         else:
-            print(f"YTMusic API returned no radio playlist for {id}. Response keys: {radio.keys() if radio else 'None'}")
+            print(f"YTMusic API returned no radio playlist or no tracks for {id}. Response keys: {radio.keys() if radio else 'None'}")
             return {"error":"Could not generate a radio playlist for this song."}, 404
 
     except Exception as e:
         print(f"Error fetching radio playlist for {id}: {str(e)}")
-        return {"error":"Internal Server Error fetching radio playlist","errorDetails":str(e)}, 500
+        # Check if it looks like a private/deleted video issue
+        error_str = str(e).lower()
+        if "private or does not exist" in error_str or "invalid video id" in error_str:
+             return {"error":"Could not get radio playlist (song might be private or unavailable)."}, 404
+        else:
+             return {"error":"Internal Server Error fetching radio playlist","errorDetails":str(e)}, 500
 
 @app.route("/search/<q>")
 @app.route("/search/<q>/songs")
@@ -679,12 +826,36 @@ def getRadio(id):
 def search(q):
     print(f"Performing search for query: '{q}'")
     try:
+        # Use a timeout for the search request as well
+        # ytmusicapi doesn't have a built-in timeout for search, so this is a limitation
+        # You might need to implement a separate thread/timeout mechanism if ytmusicapi.search itself hangs
+        # For now, relying on potential underlying network timeouts from requests within ytmusicapi
+        # and the Gunicorn worker timeout as a last resort.
         results = ytmusic.search(query=q, filter="songs", limit=32)
-        print(f"Search for '{q}' returned {len(results)} results.")
+
         # ytmusicapi search returns a list directly, no need to check for KeyError like get_song
-        return results # Should return a list of dictionaries
+        if results is not None and isinstance(results, list):
+             print(f"Search for '{q}' returned {len(results)} results.")
+             # Optional: Proxy thumbnails in search results
+             for result in results:
+                  if result.get("thumbnail", {}).get("thumbnails"):
+                        thumbnails = result["thumbnail"]["thumbnails"]
+                        if thumbnails:
+                             best_thumbnail_url = thumbnails[-1].get("url")
+                             if best_thumbnail_url:
+                                  encoded_proxy_url = urllib.parse.quote_plus(best_thumbnail_url)
+                                  result["thumbnail"]["thumbnails"] = [{"url": f"{request.url_root.rstrip('/')}/lh3Proxy/{encoded_proxy_url}"}]
+                                  if 'thumbnail' in result and 'url' in result['thumbnail']:
+                                       result['thumbnail']['url'] = f"{request.url_root.rstrip('/')}/lh3Proxy/{encoded_proxy_url}"
+
+             return results
+        else:
+             print(f"Search for '{q}' returned unexpected data type: {type(results)}. Data: {results}")
+             return {"error": "Search returned results in an unexpected format."}, 500
+
     except Exception as e:
         print(f"Error during search for '{q}': {str(e)}")
+        # Check for common ytmusicapi errors during search if needed
         return {"error":"Internal Server Error during search","errorDetails":str(e)}, 500
 
 # Add a simple health check endpoint
@@ -696,4 +867,9 @@ def health_check():
 if __name__ == '__main__':
     # Consider using a production WSGI server like Gunicorn in production
     # For local testing:
-    app.run(debug=True, port=5000) # Changed default port to 5000, common for Flask
+    # Make sure debug is False in production
+    # app.run(debug=True, port=5000)
+    # To match railway behavior more closely for local testing, run with gunicorn:
+    # gunicorn -w 4 -b 0.0.0.0:5000 app:app --timeout 60
+    print("Warning: Running with Flask development server. Use a WSGI server like Gunicorn for production.")
+    app.run(debug=True, host='0.0.0.0', port=os.environ.get('PORT', 5000)) # Use PORT env var if available
