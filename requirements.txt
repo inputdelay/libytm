@@ -5,3 +5,4 @@ requests
 Flask-Caching
 flask_cors
 python-dotenv
+gunicorn
